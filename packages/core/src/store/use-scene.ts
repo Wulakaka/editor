@@ -66,7 +66,11 @@ function getVector3(value: unknown, fallback: [number, number, number]): [number
   ]
 }
 
+/**
+ * 规范化 stair 节点的字段，确保类型安全和默认值，同时兼容旧版本的字段格式
+ */
 function normalizeStairNode(node: Record<string, unknown>) {
+  // 初始化并规范化字段，确保类型安全和默认值
   const sanitized = {
     ...node,
     position: getVector3(node.position, [0, 0, 0]),
@@ -412,6 +416,23 @@ function migrateRoofSurfaceMaterials(node: Record<string, any>) {
   return next
 }
 
+/**
+ * 复制一份输入节点表到 patchedNodes，然后逐个节点处理。
+处理旧字段到新字段的迁移，比如：
+item 缺少 scale 时补默认值。
+旧 roof（无 children）拆成 roof + 新建 roof-segment。
+roof-segment 的 pitch 不合法时，用 roofHeight 推导，推不出来就回退默认 40。
+对部分节点做规范化和兜底：
+door、stair、stair-segment、shelf、elevator 会走 normalize，补默认值并做类型收敛。
+wall、stair、roof 会做材质字段迁移（旧 material 拆分到新表面材质字段）。
+修复父子关系与结构问题：
+elevator 从 level 父节点迁到 building 父节点（旧数据兼容）。
+roof-segment 缺 children 时补空数组，避免后续挂子元素失败。
+roof 上的 door/window/item 旧坐标格式迁到新 roofFace + 局部坐标格式。
+site.children 里若残留内嵌对象，扁平化为 id，并把子节点吸收到节点字典。
+ * @param nodes 
+ * @returns 迁移后的 patchedNodes（包含新增、修改后的节点）
+ */
 function migrateNodes(nodes: Record<string, any>): Record<string, AnyNode> {
   const patchedNodes = { ...nodes }
   for (const [id, node] of Object.entries(patchedNodes)) {
@@ -683,49 +704,74 @@ function collectReachableNodeIds(
 
 export type SceneState = {
   // 1. The Data: A flat dictionary of all nodes
+  // 1. 数据：所有节点的扁平化字典
   nodes: Record<AnyNodeId, AnyNode>
 
   // 2. The Root: Which nodes are at the top level?
+  // 2. 根节点：哪些节点位于顶层？
   rootNodeIds: AnyNodeId[]
 
   // 3. The "Dirty" Set: For the Wall/Physics systems
+  // 3. 脏节点集合：用于墙体/物理系统
   dirtyNodes: Set<AnyNodeId>
 
   // 4. Relational metadata — not nodes
+  // 4. 关系元数据 — 非节点
   collections: Record<CollectionId, Collection>
 
   // 5. Read-only lock — when true all create/update/delete operations are no-ops
+  // 5. 只读锁 — 当为 true 时，所有创建/更新/删除操作都是无效的
   readOnly: boolean
   setReadOnly: (readOnly: boolean) => void
 
   // Actions
+  // 动作
+  // 加载场景
   loadScene: () => void
+  // 清除场景
   clearScene: () => void
+  // 卸载场景
   unloadScene: () => void
+  // 设置场景
   setScene: (nodes: Record<AnyNodeId, AnyNode>, rootNodeIds: AnyNodeId[]) => void
 
+  // 标记节点为脏
   markDirty: (id: AnyNodeId) => void
+  // 清除节点的脏标记
   clearDirty: (id: AnyNodeId) => void
 
+  // 节点操作
+  // 创建节点
   createNode: (node: AnyNode, parentId?: AnyNodeId) => void
+  // 批量创建节点
   createNodes: (ops: { node: AnyNode; parentId?: AnyNodeId }[]) => void
+  // 批量应用节点更改（创建、更新、删除）
   applyNodeChanges: (changes: {
     create?: { node: AnyNode; parentId?: AnyNodeId }[]
     update?: { id: AnyNodeId; data: Partial<AnyNode> }[]
     delete?: AnyNodeId[]
   }) => void
 
+  // 更新节点
   updateNode: (id: AnyNodeId, data: Partial<AnyNode>) => void
+  // 批量更新节点
   updateNodes: (updates: { id: AnyNodeId; data: Partial<AnyNode> }[]) => void
 
+  // 删除节点
   deleteNode: (id: AnyNodeId) => void
+  // 批量删除节点
   deleteNodes: (ids: AnyNodeId[]) => void
 
   // Collection actions
+  // 创建集合
   createCollection: (name: string, nodeIds?: AnyNodeId[]) => CollectionId
+  // 删除集合
   deleteCollection: (id: CollectionId) => void
+  // 更新集合
   updateCollection: (id: CollectionId, data: Partial<Omit<Collection, 'id'>>) => void
+  // 向集合添加节点
   addToCollection: (id: CollectionId, nodeId: AnyNodeId) => void
+  // 从集合移除节点
   removeFromCollection: (id: CollectionId, nodeId: AnyNodeId) => void
 }
 
@@ -754,6 +800,7 @@ const useScene: UseSceneStore = create<SceneState>()(
       readOnly: false,
       setReadOnly: (readOnly: boolean) => set({ readOnly }),
 
+      // 设置场景为空，清除所有内容
       unloadScene: () => {
         set({
           nodes: {},
@@ -763,6 +810,7 @@ const useScene: UseSceneStore = create<SceneState>()(
         })
       },
 
+      // 清除后加载默认场景
       clearScene: () => {
         get().unloadScene()
         get().loadScene() // Default scene
@@ -770,9 +818,11 @@ const useScene: UseSceneStore = create<SceneState>()(
 
       setScene: (nodes, rootNodeIds) => {
         // Apply backward compatibility migrations
+        // 应用向后兼容迁移，获取迁移后的节点表
         const patchedNodes = migrateNodes(nodes)
 
         // Remove orphans: nodes whose parentId points to a non-existent node
+        // 移除孤儿节点：parentId 指向不存在节点的节点
         const cleanedNodes = { ...patchedNodes }
         for (const node of Object.values(cleanedNodes)) {
           if (node.parentId && !cleanedNodes[node.parentId]) {
@@ -787,6 +837,7 @@ const useScene: UseSceneStore = create<SceneState>()(
           }
         }
 
+        // 设置状态为迁移和清理后的节点表
         set({
           nodes: cleanedNodes,
           rootNodeIds,
@@ -794,6 +845,7 @@ const useScene: UseSceneStore = create<SceneState>()(
           collections: {},
         })
 
+        // TODO
         const normalizedRootNodeIds = normalizeRootNodeIds(cleanedNodes, rootNodeIds)
         const reachableNodeIds = collectReachableNodeIds(cleanedNodes, normalizedRootNodeIds)
         if (normalizedRootNodeIds.length > 0) {
